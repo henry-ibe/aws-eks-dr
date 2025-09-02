@@ -1,0 +1,57 @@
+name: Build & Deploy
+on:
+  push:
+    paths: ["app/**","k8s/**",".github/workflows/build-deploy.yml"]
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION_PRIMARY: ${{ vars.PRIMARY_REGION }}
+      AWS_REGION_DR: ${{ vars.DR_REGION }}
+      EKS_PRIMARY_NAME: ${{ vars.EKS_PRIMARY_NAME || 'dr-primary' }}
+      EKS_DR_NAME: ${{ vars.EKS_DR_NAME || 'dr-secondary' }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+      - name: Build & Push
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}/demo
+          TAG=${{ github.sha }}
+          docker build -t "$IMAGE:$TAG" app
+          docker push "$IMAGE:$TAG"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: ${{ env.AWS_ROLE_ARN }}, aws-region: ${{ env.AWS_REGION_PRIMARY }} }
+      - name: Install kubectl
+        run: |
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+      - name: Update kubeconfigs
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION_PRIMARY" --name "$EKS_PRIMARY_NAME" --alias "$EKS_PRIMARY_NAME"
+          aws eks update-kubeconfig --region "$AWS_REGION_DR" --name "$EKS_DR_NAME" --alias "$EKS_DR_NAME"
+      - name: Deploy to PRIMARY
+        run: |
+          sed -i "s#ghcr.io/henry-ibe/aws-eks-dr/demo:dev#$IMAGE:$TAG#g" k8s/base/deployment.yaml
+          kubectl --context "$EKS_PRIMARY_NAME" create ns app --dry-run=client -o yaml | kubectl apply -f -
+          kubectl --context "$EKS_PRIMARY_NAME" -n app apply -k k8s/overlays/primary
+          kubectl --context "$EKS_PRIMARY_NAME" -n app rollout status deploy/demo --timeout=180s
+      - name: Deploy to DR
+        run: |
+          kubectl --context "$EKS_DR_NAME" create ns app --dry-run=client -o yaml | kubectl apply -f -
+          kubectl --context "$EKS_DR_NAME" -n app apply -k k8s/overlays/dr
+          kubectl --context "$EKS_DR_NAME" -n app rollout status deploy/demo --timeout=180s
+      - name: Show Service LBs
+        run: |
+          for CTX in "$EKS_PRIMARY_NAME" "$EKS_DR_NAME"; do
+            echo "=== $CTX ==="
+            kubectl --context "$CTX" -n app get svc demo -o wide
+          done

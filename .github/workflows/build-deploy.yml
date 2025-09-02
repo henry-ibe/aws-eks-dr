@@ -1,7 +1,8 @@
 name: Build & Deploy
+
 on:
-  workflow_dispatch: {}            # manual runs
-  push:                            # runs on pushes to main
+  workflow_dispatch: {}
+  push:
     branches: [ "main" ]
     paths:
       - "app/**"

@@ -1,0 +1,25 @@
+name: Route53 Failover
+on: { workflow_dispatch: {} }
+permissions: { id-token: write, contents: read }
+jobs:
+  r53:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      ROOT_DOMAIN: ${{ vars.ROOT_DOMAIN }}
+      APP_SUBDOMAIN: ${{ vars.APP_SUBDOMAIN }}
+      PRIMARY_REGION: ${{ vars.PRIMARY_REGION }}
+      DR_REGION: ${{ vars.DR_REGION }}
+      EKS_PRIMARY_NAME: ${{ vars.EKS_PRIMARY_NAME || 'dr-primary' }}
+      EKS_DR_NAME: ${{ vars.EKS_DR_NAME || 'dr-secondary' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: ${{ env.AWS_ROLE_ARN }}, aws-region: ${{ env.PRIMARY_REGION }} }
+      - name: Install kubectl
+        run: |
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+      - name: Create/Update Route53 failover
+        run: |
+          ./scripts/route53_failover.sh

@@ -1,0 +1,73 @@
+name: DR Drill
+on: { workflow_dispatch: {} }
+permissions: { id-token: write, contents: read }
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      PRIMARY_REGION: ${{ vars.PRIMARY_REGION }}
+      DR_REGION: ${{ vars.DR_REGION }}
+      EKS_PRIMARY_NAME: ${{ vars.EKS_PRIMARY_NAME || 'dr-primary' }}
+      EKS_DR_NAME: ${{ vars.EKS_DR_NAME || 'dr-secondary' }}
+      ROOT_DOMAIN: ${{ vars.ROOT_DOMAIN }}
+      APP_SUBDOMAIN: ${{ vars.APP_SUBDOMAIN }}
+      PUBLIC_HOST: ${{ format('{0}.{1}', vars.APP_SUBDOMAIN, vars.ROOT_DOMAIN) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.PRIMARY_REGION }}
+      - name: Install kubectl + dnsutils
+        run: |
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          sudo apt-get update -y && sudo apt-get install -y dnsutils
+      - name: Kubeconfigs
+        run: |
+          aws eks update-kubeconfig --region "$PRIMARY_REGION" --name "$EKS_PRIMARY_NAME" --alias "$EKS_PRIMARY_NAME"
+          aws eks update-kubeconfig --region "$DR_REGION" --name "$EKS_DR_NAME" --alias "$EKS_DR_NAME"
+      - name: Discover LB hostnames & hosted zone
+        id: disc
+        run: |
+          set -euo pipefail
+          P=$(kubectl --context "$EKS_PRIMARY_NAME" -n app get svc demo -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          D=$(kubectl --context "$EKS_DR_NAME" -n app get svc demo -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          HZID=$(aws route53 list-hosted-zones-by-name --dns-name "${ROOT_DOMAIN}." --query 'HostedZones[0].Id' --output text | sed 's:.*/::')
+          echo "primary_lb=$P" >> $GITHUB_OUTPUT
+          echo "dr_lb=$D"     >> $GITHUB_OUTPUT
+          echo "hzid=$HZID"   >> $GITHUB_OUTPUT
+          echo "Primary:  $P"; echo "DR: $D"; echo "HostedZone: $HZID"
+      - name: Show current authoritative answer
+        run: |
+          aws route53 test-dns-answer \
+            --hosted-zone-id "${{ steps.disc.outputs.hzid }}" \
+            --record-name "${PUBLIC_HOST}." \
+            --record-type A
+      - name: Scale PRIMARY to 0
+        run: |
+          kubectl --context "$EKS_PRIMARY_NAME" -n app scale deploy/demo --replicas=0
+      - name: Wait until Route53 prefers DR
+        run: |
+          set -euo pipefail
+          DR_IPS=$(dig +short "${{ steps.disc.outputs.dr_lb }}")
+          echo "DR LB IPs:"; echo "$DR_IPS" | sed 's/^/  /'
+          for i in $(seq 1 18); do
+            ANSWER=$(aws route53 test-dns-answer \
+              --hosted-zone-id "${{ steps.disc.outputs.hzid }}" \
+              --record-name "${PUBLIC_HOST}." \
+              --record-type A \
+              --query 'RecordData' --output text || true)
+            echo "Authoritative answer: $ANSWER"
+            if comm -12 <(echo "$ANSWER" | tr ' ' '\n' | sort) <(echo "$DR_IPS" | sort) | grep -q .; then
+              echo "✅ Route53 is answering with DR"; exit 0
+            fi
+            sleep 10
+          done
+          echo "❌ Route53 did not flip to DR in time"; exit 1
+      - name: Scale PRIMARY back
+        if: always()
+        run: |
+          kubectl --context "$EKS_PRIMARY_NAME" -n app scale deploy/demo --replicas=2

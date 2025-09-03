@@ -1,6 +1,16 @@
 name: Route53 Failover
-on: { workflow_dispatch: {} }
-permissions: { id-token: write, contents: read }
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ "main" ]
+    paths:
+      - "scripts/route53_failover.sh"
+      - ".github/workflows/route53-failover.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   r53:
     runs-on: ubuntu-latest
@@ -15,11 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
-        with: { role-to-assume: ${{ env.AWS_ROLE_ARN }}, aws-region: ${{ env.PRIMARY_REGION }} }
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.PRIMARY_REGION }}
       - name: Install kubectl
         run: |
           curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+      - name: Who am I?
+        run: aws sts get-caller-identity
       - name: Create/Update Route53 failover
-        run: |
-          ./scripts/route53_failover.sh
+        run: ./scripts/route53_failover.sh
